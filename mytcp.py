@@ -54,6 +54,7 @@ class Conexao:
         self.id_conexao = id_conexao
         self.callback = None
         self.seq_no = random.randint(0, 0xffff)
+        self.send_base = self.seq_no
         self.ack_no = ack_no
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
         #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
@@ -63,6 +64,7 @@ class Conexao:
         resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
         self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
 
+        self.seq_no += 1
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
         print('Este é um exemplo de como fazer um timer')
@@ -78,7 +80,6 @@ class Conexao:
 
             resp_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_ACK)
             resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
-            self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
 
             self.callback(self, payload)
 
@@ -98,7 +99,13 @@ class Conexao:
         # TODO: implemente aqui o envio de dados.
         # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
         # que você construir para a camada de rede.
-        pass
+        for packet_num in range((len(dados)//MSS)):
+            resp_segment = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.ack_no, FLAGS_ACK) + dados[packet_num*MSS:(packet_num+1)*MSS]
+            resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+
+            self.servidor.rede.enviar(resp_segment, self.id_conexao[2])
+
+            self.seq_no += len(dados[packet_num*MSS:(packet_num+1)*MSS])
 
     def fechar(self):
         """
