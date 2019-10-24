@@ -7,7 +7,6 @@ from mytcputils import *
 class Servidor:
 
     def __init__(self, rede, porta):
-        self.__next_seq = 1000
         self.rede = rede
         self.porta = porta
         self.conexoes = {}
@@ -72,7 +71,16 @@ class Conexao:
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        print('recebido payload: %r' % payload)
+        if (seq_no == self.ack_no):
+            print('recebido payload: %r' % payload)
+
+            self.ack_no += len(payload)
+
+            resp_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_ACK)
+            resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+            self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
+
+            self.callback(self, payload)
 
     # Os métodos abaixo fazem parte da API
 
