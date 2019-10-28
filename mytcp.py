@@ -74,6 +74,11 @@ class Conexao:
         self.estimated_rtt = None
         self.dev_rtt = None
 
+        # Congestion control attributes
+        self.segment_window = 1
+        self.data_on_hold = b''
+        self.last_sent_seq_no = None
+
         # Start handshake protocol sending SYN+ACK segment to source.
         self.send_synack_segment()
 
@@ -103,6 +108,7 @@ class Conexao:
     def __retransmit(self):
         self.timer = None
         self.is_waiting_retransmited_segment = True
+        self.segment_window = self.segment_window // 2
 
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
@@ -121,7 +127,7 @@ class Conexao:
         if is_expected_segment_sent(seq_no, self.ack_no):
 
             if ack_no > self.send_base and (flags & FLAGS_ACK) == FLAGS_ACK:
-                self.non_acked_data = self.non_acked_data[ack_no-self.send_base:]
+                self.non_acked_data = self.non_acked_data[ack_no - self.send_base:]
                 self.send_base = ack_no
 
                 if self.non_acked_data:
@@ -131,6 +137,10 @@ class Conexao:
                     if not self.is_waiting_retransmited_segment:
                         self.acked_time = time.time()
                         self.estimate_rtt()
+
+            if self.last_sent_seq_no == ack_no:
+                self.segment_window += 1
+                self.enviar(self.data_on_hold)
 
             self.is_waiting_retransmited_segment = False
             self.ack_no += len(payload)
@@ -152,15 +162,14 @@ class Conexao:
         segments = []
 
         # Check how many times the data is bigger than a TCP payload
-        for packet_num in range((len(data)//MSS)):
+        for packet_num in range((len(data) // MSS)):
             # Split payload in multiple segments
-            payload = data[packet_num * MSS : (packet_num + 1) * MSS]
+            payload = data[packet_num * MSS: (packet_num + 1) * MSS]
 
             # Add to created segments lists
             segments.append(payload)
 
         return segments
-
 
     def estimate_rtt(self):
         alfa = 0.125
@@ -179,7 +188,7 @@ class Conexao:
             self.dev_rtt = self.sample_rtt / 2
         else:
             self.estimated_rtt = (1 - alfa) * self.estimated_rtt + alfa * self.sample_rtt
-            self.dev_rtt       = (1 - beta) * self.dev_rtt + beta * abs(self.sample_rtt - self.estimated_rtt)
+            self.dev_rtt = (1 - beta) * self.dev_rtt + beta * abs(self.sample_rtt - self.estimated_rtt)
 
         self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
 
@@ -198,8 +207,13 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
+
+        data_ready = dados[:MSS*self.segment_window]
+        self.data_on_hold = dados[MSS*self.segment_window:]
+        self.last_sent_seq_no = self.seq_no + len(data_ready)
+
         # Segmentate data if it's too big for a TCP payload
-        segments = self.segmentate_data(dados)
+        segments = self.segmentate_data(data_ready)
 
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
