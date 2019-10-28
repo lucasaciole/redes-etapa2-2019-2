@@ -1,13 +1,10 @@
 import pdb
+import time
+import math
 import random
 import asyncio
 from mytcputils import *
 
-def is_fin_segment(flags):
-    return (flags & FLAGS_FIN) == FLAGS_FIN
-
-def is_expected_segment_sent(seq_no, ack_no):
-    return seq_no == ack_no
 
 class Servidor:
 
@@ -33,13 +30,13 @@ class Servidor:
             # Ignora segmentos que não são destinados à porta do nosso servidor
             return
 
-        payload = segment[4*(flags>>12):]
+        payload = segment[4 * (flags >> 12):]
         id_conexao = (src_addr, src_port, dst_addr, dst_port)
 
         if (flags & FLAGS_SYN) == FLAGS_SYN:
             # A flag SYN estar setada significa que é um cliente tentando estabelecer uma conexão nova
             # TODO: talvez você precise passar mais coisas para o construtor de conexão
-            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no+1)
+            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no + 1)
 
             if self.callback:
                 self.callback(conexao)
@@ -58,33 +55,45 @@ class Conexao:
     def __init__(self, servidor, id_conexao, ack_no):
         self.servidor = servidor
         self.id_conexao = id_conexao
-        self.timer = self.callback = None
         self.seq_no = random.randint(0, 0xffff)
         self.send_base = self.seq_no
         self.non_acked_data = b''
         self.ack_no = ack_no
+        self.timer = None
+        self.callback = None
+
+        # attributes used to calc RTT
+        self.sent_time = 0
+        self.acked_time = 0
+        self.is_first_rtt_sampled = True
+        self.is_waiting_retransmited_segment = False
+
+        # RTT and timeout interval attributes
+        self.timeout_interval = 2
+        self.sample_rtt = None
+        self.estimated_rtt = None
+        self.dev_rtt = None
 
         # Start handshake protocol sending SYN+ACK segment to source.
         self.send_synack_segment()
 
-
     def send_synack_segment(self):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-        #builds SYN+ACK segment with empty payload
-        header  = make_header(dst_port,src_port, self.seq_no, self.ack_no, FLAGS_SYN | FLAGS_ACK)
+        # builds SYN+ACK segment with empty payload
+        header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_SYN | FLAGS_ACK)
         segment = fix_checksum(header + b'', src_addr, dst_addr)
 
-        #sends segment through network layer
+        # sends segment through network layer
         self.servidor.rede.enviar(segment, src_addr)
 
-        #updates nextSeqNum expected to receive data
+        # updates nextSeqNum expected to receive data
         self.seq_no += 1
-
+        self.send_base = self.seq_no
 
     def __start_timer(self):
         self.__stop_timer()
-        self.timer = asyncio.get_event_loop().call_later(2, self.__retransmit)
+        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval, self.__retransmit)
 
     def __stop_timer(self):
         if self.timer:
@@ -92,6 +101,9 @@ class Conexao:
             self.timer = None
 
     def __retransmit(self):
+        self.timer = None
+        self.is_waiting_retransmited_segment = True
+
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
         payload = self.non_acked_data[:min(MSS, len(self.non_acked_data))]
@@ -100,6 +112,7 @@ class Conexao:
         segment = fix_checksum(header + payload, dst_addr, src_addr)
 
         self.servidor.rede.enviar(segment, src_addr)
+
         self.__start_timer()
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
@@ -107,18 +120,19 @@ class Conexao:
 
         if is_expected_segment_sent(seq_no, self.ack_no):
 
-            if self.non_acked_data:
+            if ack_no > self.send_base and (flags & FLAGS_ACK) == FLAGS_ACK:
                 self.non_acked_data = self.non_acked_data[ack_no-self.send_base:]
                 self.send_base = ack_no
-
-            if ack_no > self.send_base and (flags & FLAGS_ACK) == FLAGS_ACK:
-                self.send_base = ack_no - 1
 
                 if self.non_acked_data:
                     self.__start_timer()
                 else:
                     self.__stop_timer()
+                    if not self.is_waiting_retransmited_segment:
+                        self.acked_time = time.time()
+                        self.estimate_rtt()
 
+            self.is_waiting_retransmited_segment = False
             self.ack_no += len(payload)
 
             # Received connection close request
@@ -133,6 +147,43 @@ class Conexao:
                 self.servidor.rede.enviar(resp_segment, src_addr)
 
             self.callback(self, payload)
+
+    def segmentate_data(self, data):
+        segments = []
+
+        # Check how many times the data is bigger than a TCP payload
+        for packet_num in range((len(data)//MSS)):
+            # Split payload in multiple segments
+            payload = data[packet_num * MSS : (packet_num + 1) * MSS]
+
+            # Add to created segments lists
+            segments.append(payload)
+
+        return segments
+
+
+    def estimate_rtt(self):
+        alfa = 0.125
+        beta = 0.25
+
+        if not self.acked_time and self.sent_time:
+            return
+
+        self.sample_rtt = self.acked_time - self.sent_time
+        print("Sample %.3f = %.3f - %.3f" % (self.sample_rtt, self.acked_time, self.sent_time))
+
+        if self.is_first_rtt_sampled:
+            self.is_first_rtt_sampled = not self.is_first_rtt_sampled
+
+            self.estimated_rtt = self.sample_rtt
+            self.dev_rtt = self.sample_rtt / 2
+        else:
+            self.estimated_rtt = (1 - alfa) * self.estimated_rtt + alfa * self.sample_rtt
+            self.dev_rtt       = (1 - beta) * self.dev_rtt + beta * abs(self.sample_rtt - self.estimated_rtt)
+
+        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
+
+        print("New timeout interval: %.3f" % self.timeout_interval)
 
     # Os métodos abaixo fazem parte da API
 
@@ -156,6 +207,7 @@ class Conexao:
             # Create segment to given payload chunk
             header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
             segment = fix_checksum(header + payload, dst_addr, src_addr)
+
             self.non_acked_data += payload
 
             # Update next sequence number to be used in a new segment
@@ -165,32 +217,25 @@ class Conexao:
             self.servidor.rede.enviar(segment, src_addr)
 
             # Start retransmission timer for sent segment if not yet started
-            if not self.timer:
+            if self.timer is None:
+                self.sent_time = time.time()
                 self.__start_timer()
-
-
-    def segmentate_data(self, data):
-        segments = []
-
-        # Check how many times the data is bigger than a TCP payload
-        for packet_num in range((len(data)//MSS)):
-            # Split payload in multiple segments
-            payload = data[packet_num * MSS : (packet_num + 1) * MSS]
-
-            # Add to created segments lists
-            segments.append(payload)
-
-        return segments
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
-
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        segment = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN)
-        segment = fix_checksum(segment, dst_addr, src_addr)
 
-        print('Enviando pacote: %i %i' % (self.seq_no, self.ack_no))
+        header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN)
+        segment = fix_checksum(header + b'', dst_addr, src_addr)
+
         self.servidor.rede.enviar(segment, src_addr)
-        pass
+
+
+# Utility methods
+def is_fin_segment(flags):
+    return (flags & FLAGS_FIN) == FLAGS_FIN
+
+def is_expected_segment_sent(seq_no, ack_no):
+    return seq_no == ack_no
