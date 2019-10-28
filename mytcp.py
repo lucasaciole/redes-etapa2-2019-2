@@ -3,6 +3,11 @@ import random
 import asyncio
 from mytcputils import *
 
+def is_fin_segment(flags):
+    return (flags & FLAGS_FIN) == FLAGS_FIN
+
+def is_expected_segment_sent(seq_no, ack_no):
+    return seq_no == ack_no
 
 class Servidor:
 
@@ -41,57 +46,66 @@ class Servidor:
         elif id_conexao in self.conexoes:
             # Passa para a conexão adequada se ela já estiver estabelecida
             self.conexoes[id_conexao]._rdt_rcv(seq_no, ack_no, flags, payload)
+            if (flags & FLAGS_FIN) == FLAGS_FIN:
+                self.conexoes.pop(id_conexao)
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
 
 
 class Conexao:
+
     def __init__(self, servidor, id_conexao, ack_no):
         self.servidor = servidor
-        self.id_conexao = id_conexao # (0 src_addr, 1 src_port, 2 dst_addr, 3 dst_port)
+        self.id_conexao = id_conexao
         self.callback = None
         self.seq_no = random.randint(0, 0xffff)
-        self.send_base = self.seq_no
         self.ack_no = ack_no
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
 
-        print("Criada conexão com %s usando seq_no %i. ack_no recebido: %i" % (id_conexao[0], self.seq_no, ack_no))
+        # Start handshake protocol sending SYN+ACK segment to source.
+        self.send_synack_segment()
 
-        # Envio do pacote SYN+ACK. HANDSHAKE
-        resp_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_SYN + FLAGS_ACK)
-        resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
-        self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
 
+    def send_synack_segment(self):
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        #builds SYN+ACK segment with empty payload
+        header  = make_header(dst_port,src_port, self.seq_no, self.ack_no, FLAGS_SYN | FLAGS_ACK)
+        segment = fix_checksum(header + b'', src_addr, dst_addr)
+
+        #sends segment through network layer
+        self.servidor.rede.enviar(segment, src_addr)
+
+        #updates nextSeqNum expected to receive data
         self.seq_no += 1
-    def _exemplo_timer(self):
-        # Esta função é só um exemplo e pode ser removida
-        print('Este é um exemplo de como fazer um timer')
+
+    def _retransmission_timer(self, segment, seq_no):
+        _, _, dst_addr, _ = self.id_conexao
+        print('Timeout for segment of seq_no %i' % seq_no)
+
+        if (seq_no == self.send_base):
+            print('Relaying segment with seq_no and ack_no: %i %i' % (seq_no, self.ack_no))
+            self.servidor.rede.enviar(segment, dst_addr)
+        else:
+            print("Won't resend segment with seq_no %i and ack_no %i since it's not the oldest segment" % (seq_no, self.ack_no))
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
-        # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
-        # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        if((flags & FLAGS_FIN) == FLAGS_FIN): # Flag FIN enviada:
-            resp_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, seq_no+1, FLAGS_FIN|FLAGS_ACK) + b''
-            resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-            self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
-            self.callback(self, payload)
-        elif (seq_no == self.ack_no):
-            print('Recebido pacote: %i %i' % (seq_no, ack_no))
-
+        if is_expected_segment_sent(seq_no, self.ack_no):
             self.ack_no += len(payload)
 
-            resp_segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, self.ack_no, FLAGS_ACK)
-            resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+            if is_fin_segment(flags):
+                self.ack_no += 1
+                flags = FLAGS_FIN | FLAGS_ACK
 
-            self.servidor.rede.enviar(resp_segment, self.id_conexao[0])
+            # Send ACK segment to confirm payload reception or fin reception
+            if is_fin_segment(flags) or len(payload) > 0:
+                resp_header = make_header(src_port, dst_port, self.seq_no, self.ack_no, flags)
+                resp_segment = fix_checksum(resp_header + b'', src_addr, dst_addr)
+                self.servidor.rede.enviar(resp_segment, src_addr)
 
             self.callback(self, payload)
-        else:
-            print('Recebido pacote: %i %i mas esperava pacote %i %i' % (seq_no, ack_no, self.ack_no, ack_no))
 
     # Os métodos abaixo fazem parte da API
 
@@ -106,26 +120,51 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
-        # TODO: implemente aqui o envio de dados.
-        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
-        # que você construir para a camada de rede.
-        for packet_num in range((len(dados)//MSS)):
-            resp_segment = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.ack_no, FLAGS_ACK) + dados[packet_num*MSS:(packet_num+1)*MSS]
-            resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+        # Segmentate data if it's too big for a TCP payload
+        segments = self.segmentate_data(dados)
 
-            print('Enviando pacote: %i %i' % (self.seq_no, self.ack_no))
-            self.servidor.rede.enviar(resp_segment, self.id_conexao[2])
+        src_addr, _, _, _ = self.id_conexao
 
-            self.seq_no += len(dados[packet_num*MSS:(packet_num+1)*MSS])
+        for segment, seq_num in segments:
+            # Send each segment through network layer
+            self.servidor.rede.enviar(segment, src_addr)
+
+            # Start retransmission timer for sent segment
+            asyncio.get_event_loop().call_later(1.2, self._retransmission_timer, segment, seq_num)
+
+
+    def segmentate_data(self, data):
+        segments = []
+
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        # Check how many times the data is bigger than a TCP payload
+        for packet_num in range((len(data)//MSS)):
+            # Split payload in multiple segments
+            payload = data[packet_num*MSS:(packet_num+1)*MSS]
+
+
+            # Create segment to given payload chunk
+            header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            segment = fix_checksum(header + payload, dst_addr, src_addr)
+
+            # Add to created segments lists
+            segments.append((segment, self.seq_no))
+
+            # Update next sequence number to be used in a new segment
+            self.seq_no += len(payload)
+
+        return segments
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
-        # TODO: implemente aqui o fechamento de conexão
-        resp_segment = make_header(self.id_conexao[1], self.id_conexao[3], self.seq_no, self.ack_no, FLAGS_FIN)
-        resp_segment = fix_checksum(resp_segment, self.id_conexao[0], self.id_conexao[2])
+
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+        segment = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_FIN)
+        segment = fix_checksum(segment, dst_addr, src_addr)
 
         print('Enviando pacote: %i %i' % (self.seq_no, self.ack_no))
-        self.servidor.rede.enviar(resp_segment, self.id_conexao[2])
+        self.servidor.rede.enviar(segment, src_addr)
         pass
