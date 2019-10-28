@@ -58,8 +58,10 @@ class Conexao:
     def __init__(self, servidor, id_conexao, ack_no):
         self.servidor = servidor
         self.id_conexao = id_conexao
-        self.callback = None
+        self.timer = self.callback = None
         self.seq_no = random.randint(0, 0xffff)
+        self.send_base = self.seq_no
+        self.non_acked_data = b''
         self.ack_no = ack_no
 
         # Start handshake protocol sending SYN+ACK segment to source.
@@ -79,22 +81,47 @@ class Conexao:
         #updates nextSeqNum expected to receive data
         self.seq_no += 1
 
-    def _retransmission_timer(self, segment, seq_no):
-        _, _, dst_addr, _ = self.id_conexao
-        print('Timeout for segment of seq_no %i' % seq_no)
 
-        if (seq_no == self.send_base):
-            print('Relaying segment with seq_no and ack_no: %i %i' % (seq_no, self.ack_no))
-            self.servidor.rede.enviar(segment, dst_addr)
-        else:
-            print("Won't resend segment with seq_no %i and ack_no %i since it's not the oldest segment" % (seq_no, self.ack_no))
+    def __start_timer(self):
+        self.__stop_timer()
+        self.timer = asyncio.get_event_loop().call_later(2, self.__retransmit)
+
+    def __stop_timer(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
+    def __retransmit(self):
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
+
+        payload = self.non_acked_data[:min(MSS, len(self.non_acked_data))]
+
+        header = make_header(dst_port, src_port, self.send_base, self.ack_no, FLAGS_ACK)
+        segment = fix_checksum(header + payload, dst_addr, src_addr)
+
+        self.servidor.rede.enviar(segment, src_addr)
+        self.__start_timer()
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
         if is_expected_segment_sent(seq_no, self.ack_no):
+
+            if self.non_acked_data:
+                self.non_acked_data = self.non_acked_data[ack_no-self.send_base:]
+                self.send_base = ack_no
+
+            if ack_no > self.send_base and (flags & FLAGS_ACK) == FLAGS_ACK:
+                self.send_base = ack_no - 1
+
+                if self.non_acked_data:
+                    self.__start_timer()
+                else:
+                    self.__stop_timer()
+
             self.ack_no += len(payload)
 
+            # Received connection close request
             if is_fin_segment(flags):
                 self.ack_no += 1
                 flags = FLAGS_FIN | FLAGS_ACK
@@ -123,36 +150,35 @@ class Conexao:
         # Segmentate data if it's too big for a TCP payload
         segments = self.segmentate_data(dados)
 
-        src_addr, _, _, _ = self.id_conexao
+        src_addr, src_port, dst_addr, dst_port = self.id_conexao
 
-        for segment, seq_num in segments:
+        for payload in segments:
+            # Create segment to given payload chunk
+            header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
+            segment = fix_checksum(header + payload, dst_addr, src_addr)
+            self.non_acked_data += payload
+
+            # Update next sequence number to be used in a new segment
+            self.seq_no += len(payload)
+
             # Send each segment through network layer
             self.servidor.rede.enviar(segment, src_addr)
 
-            # Start retransmission timer for sent segment
-            asyncio.get_event_loop().call_later(1.2, self._retransmission_timer, segment, seq_num)
+            # Start retransmission timer for sent segment if not yet started
+            if not self.timer:
+                self.__start_timer()
 
 
     def segmentate_data(self, data):
         segments = []
 
-        src_addr, src_port, dst_addr, dst_port = self.id_conexao
-
         # Check how many times the data is bigger than a TCP payload
         for packet_num in range((len(data)//MSS)):
             # Split payload in multiple segments
-            payload = data[packet_num*MSS:(packet_num+1)*MSS]
-
-
-            # Create segment to given payload chunk
-            header = make_header(dst_port, src_port, self.seq_no, self.ack_no, FLAGS_ACK)
-            segment = fix_checksum(header + payload, dst_addr, src_addr)
+            payload = data[packet_num * MSS : (packet_num + 1) * MSS]
 
             # Add to created segments lists
-            segments.append((segment, self.seq_no))
-
-            # Update next sequence number to be used in a new segment
-            self.seq_no += len(payload)
+            segments.append(payload)
 
         return segments
 
