@@ -6,6 +6,11 @@ FLAGS_SYN = 1<<1
 FLAGS_RST = 1<<2
 FLAGS_ACK = 1<<4
 
+SRC_ADDR = 0
+SRC_PORT = 1
+DST_ADDR = 2
+DST_PORT = 3
+
 MSS = 1460   # Tamanho do payload de um segmento TCP (em bytes)
 
 
@@ -66,6 +71,8 @@ def str2addr(addr):
 def fix_checksum(segment, src_addr, dst_addr):
     """
     Corrige o checksum de um segmento TCP. É necessário passar os endereços
+    ""
+
     IPv4 de origem e de destino, já que apesar de não fazerem parte da camada
     de transporte, eles são incluídos no pseudocabeçalho, que faz parte do
     cálculo do checksum.
@@ -78,3 +85,9 @@ def fix_checksum(segment, src_addr, dst_addr):
     seg[16:18] = b'\x00\x00'
     seg[16:18] = struct.pack('!H', calc_checksum(pseudohdr + seg))
     return bytes(seg)
+
+def is_fin_segment(flags):
+    return (flags & FLAGS_FIN) == FLAGS_FIN
+
+def is_correct_payload_sent(seq_no, ack_no):
+    return seq_no == ack_no
